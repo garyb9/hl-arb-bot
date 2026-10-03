@@ -232,7 +232,12 @@ stateDiagram-v2
   yet acted on (SPEC-0004 K-4); a `live` startup logs a WARN naming them. The
   check order is kill → breaker → stale coin → unknown-on-coin → rate budget →
   open-order cap → notional → projected exposure → margin → tick/min-notional
-  (`crates/hl-arb-engine/src/risk.rs`).
+  (`crates/hl-arb-engine/src/risk.rs`). The approved **size** is exact (rounded
+  toward zero to the lot before the check), but notional and exposure caps are
+  evaluated at the `reference` price (an explicit `limit_px`, else the mid): the
+  price that reaches the wire can differ (an aggressive order is priced at the
+  touch ± `max_slippage_bps`; a non-ALO limit price is rounded to significant
+  figures), so a cap can be exceeded by up to that tolerance.
 
 ## 6. Persistence
 

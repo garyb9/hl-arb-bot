@@ -558,8 +558,19 @@ impl RiskGate {
     /// The shared checks for any risk-increasing action (place or modify).
     ///
     /// The requested size is rounded toward zero to the market's lot before any
-    /// notional or exposure check, so risk approves the exact size the builder
-    /// will send and can never overshoot a cap (PERF-003).
+    /// notional or exposure check, so the approved **size** is exactly what the
+    /// builder will send (PERF-003). Notional, however, is only *evaluated* at
+    /// the `reference` price (an explicit `limit_px`, else the slot mid), not at
+    /// the price that reaches the wire:
+    ///
+    /// - an aggressive (`limit_px: None`) buy/sell is priced at the touch
+    ///   ± `max_slippage_bps`, so it can sit beyond the reference by that
+    ///   tolerance; and
+    /// - a non-ALO limit price is rounded to the venue's significant figures,
+    ///   which can round away from the reference.
+    ///
+    /// A notional or exposure cap can therefore be exceeded by up to that
+    /// tolerance even though the size is exact.
     fn check_increasing(
         &self,
         coin: CoinId,
