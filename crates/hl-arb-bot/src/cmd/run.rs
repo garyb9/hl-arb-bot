@@ -39,6 +39,18 @@ pub(crate) async fn run(
         "starting"
     );
 
+    // Warn once here, at the live startup site, rather than inside config
+    // validation: these limits are required finite for `live` but are not yet
+    // enforced by the engine risk gate, so a configured value must not be
+    // mistaken for protection (SEC-002 / SPEC-0004 K-4).
+    if config.mode == Mode::Live {
+        tracing::warn!(
+            unenforced = ?Config::unenforced_live_limits(),
+            "live mode: these configured risk limits are validated but NOT enforced by the engine; \
+             do not rely on them as a loss cutoff (SPEC-0004 K-4)"
+        );
+    }
+
     // Strategies run in `simulate` and `live`; `observe` stays read-only.
     let plan = if config.mode == Mode::Observe {
         None

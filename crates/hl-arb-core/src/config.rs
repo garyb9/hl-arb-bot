@@ -519,14 +519,6 @@ impl Config {
                 "live mode requires a finite risk max_open_orders".into(),
             ));
         }
-        // Be loud about the limits that are required at startup but not yet
-        // enforced by the engine risk gate, so a configured value is not
-        // mistaken for protection (SEC-002 / SPEC-0004 K-4).
-        tracing::warn!(
-            unenforced = ?Self::unenforced_live_limits(),
-            "live mode: these configured risk limits are validated but NOT enforced by the engine; \
-             do not rely on them as a loss cutoff (SPEC-0004 K-4)"
-        );
         Ok(())
     }
 
@@ -534,9 +526,9 @@ impl Config {
     /// enforce (SPEC-0004 K-4).
     ///
     /// `live` validation requires these to be finite so an operator cannot
-    /// leave them unlimited, but the engine does not act on them yet. Startup
-    /// warns with this list so a configured value is not mistaken for
-    /// protection.
+    /// leave them unlimited, but the engine does not act on them yet. The
+    /// `hl run` live startup warns once with this list so a configured value is
+    /// not mistaken for protection.
     pub fn unenforced_live_limits() -> &'static [&'static str] {
         &["max_daily_loss_usd", "max_unhedged_usd"]
     }
