@@ -796,4 +796,27 @@ mod tests {
         // A post-only buy rounds down (away from the ask), never up to 12346.
         assert_eq!(order_price(&batch), ds("12345"));
     }
+
+    #[test]
+    fn post_only_sell_rounds_price_away_from_the_cross() {
+        let registry = registry();
+        let table = table(0);
+        let orders = OrderManager::new(1);
+        let mut sell = intent(Side::Sell, Some(ds("12345.678")), ds("1"));
+        sell.tif = TimeInForce::Alo;
+        let actions = vec![Action::Place(sell)];
+        let mut req_ids = ReqIds::new();
+        let batch = plan_iteration(
+            &actions,
+            &registry,
+            &table,
+            &orders,
+            &CloidAssigner::new(),
+            &touch(),
+            ds("10"),
+            &mut req_ids,
+        );
+        // A post-only sell rounds up (away from the bid), never down to 12345.
+        assert_eq!(order_price(&batch), ds("12346"));
+    }
 }

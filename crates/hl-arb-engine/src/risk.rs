@@ -1074,7 +1074,34 @@ mod tests {
         );
     }
 
-    /// The approved size never exceeds the requested size, for every lot size.
+    #[test]
+    fn cap_resize_that_rounds_to_zero_is_non_positive_size() {
+        let orders = OrderManager::new(1);
+        let acct = account("0", "1000", "0");
+        let slot = slot();
+        let meta = meta_with(2); // szDecimals = 2
+        let budget = huge_budget();
+        let mut gate = RiskGate::new(
+            RiskLimits {
+                max_order_notional: Some(ds("0.5")),
+                min_notional: ds("0.0001"),
+                ..Default::default()
+            },
+            KillSwitch::new(),
+            Breakers::new(),
+        );
+        let ctx = ctx(CoinId(0), &orders, &acct, &slot, &meta, &budget);
+        // A $0.5 cap at the $100 reference is 0.005 units, which rounds toward
+        // zero to 0.00 at szDecimals=2; the cap-driven resize is rejected.
+        assert_eq!(
+            gate.evaluate(&buy(Some(ds("100")), ds("1")), &ctx),
+            Err(RiskReason::NonPositiveSize)
+        );
+    }
+
+    /// The approved size never exceeds the requested size, for every lot size,
+    /// and the per-order notional cap actually drives the Resize path (the caps
+    /// are small enough that requests above the cap are resized).
     #[test]
     fn approved_size_never_exceeds_requested_for_any_lot() {
         let mut rng = Rng(0x1234_5678_9ABC_DEF0);
@@ -1084,9 +1111,11 @@ mod tests {
             let acct = account("0", "1000", "0");
             let slot = slot();
             let budget = huge_budget();
+            // $100 cap at the $100 reference is exactly 1 unit, so every request
+            // above 1 unit is resized by the cap rather than passing through.
             let mut gate = RiskGate::new(
                 RiskLimits {
-                    max_order_notional: Some(ds("1000000")),
+                    max_order_notional: Some(ds("100")),
                     max_position_notional: Some(ds("1000000")),
                     max_margin_utilization_bps: Some(ds("9000")),
                     min_notional: ds("0.0001"),
@@ -1095,13 +1124,19 @@ mod tests {
                 KillSwitch::new(),
                 Breakers::new(),
             );
+            let mut saw_cap_resize = false;
             for _ in 0..2_000 {
                 let requested = Decimal::from(rng.below(500) + 1) / Decimal::from(100);
                 let ctx = ctx(CoinId(0), &orders, &acct, &slot, &meta, &budget);
                 if let Ok(decision) = gate.evaluate(&buy(Some(ds("100")), requested), &ctx) {
                     let approved = match decision {
                         Decision::Approve => requested,
-                        Decision::Resize(size) => size,
+                        Decision::Resize(size) => {
+                            if requested > Decimal::ONE {
+                                saw_cap_resize = true;
+                            }
+                            size
+                        }
                         Decision::Reject(_) => continue,
                     };
                     assert!(
@@ -1110,6 +1145,10 @@ mod tests {
                     );
                 }
             }
+            assert!(
+                saw_cap_resize,
+                "sz_decimals={sz_decimals}: the notional cap never drove a resize"
+            );
         }
     }
 
@@ -1679,6 +1718,100 @@ mod tests {
         assert_eq!(
             gate.evaluate(&Action::Cancel { cloid: at_cap }, &ctx),
             Ok(Decision::Approve)
+        );
+    }
+
+    #[test]
+    fn open_order_cap_counts_every_in_flight_state() {
+        let meta = asset_meta();
+        let budget = huge_budget();
+        let slot = slot();
+        let acct = account("0", "1000", "0");
+        // Every non-terminal state still exposes risk at the venue: a not-yet
+        // acked place may be resting, a lost reply (`Unknown`) may be resting,
+        // and an unconfirmed cancel/modify still counts. Each must consume the
+        // coin's open-order budget.
+        for state in [
+            OrderState::PendingNew,
+            OrderState::Resting,
+            OrderState::PartiallyFilled,
+            OrderState::PendingCancel,
+            OrderState::PendingModify,
+            OrderState::Unknown,
+        ] {
+            let mut orders = OrderManager::new(1);
+            orders.insert(live(nth_cloid(1), 0, ds("100"), ds("1"), state, false));
+            let mut gate = RiskGate::new(
+                permissive_limits(Some(1)),
+                KillSwitch::new(),
+                Breakers::new(),
+            );
+            let ctx = ctx(CoinId(0), &orders, &acct, &slot, &meta, &budget);
+            // An `Unknown` order is caught even earlier, by the unknown-on-coin
+            // guard (step 4); every other working state reaches the cap. All of
+            // them are `is_working()`, so all are counted by the per-coin
+            // counter that backs this check (see the counter test in orders.rs).
+            let expected = if state.is_unknown() {
+                RiskReason::UnknownOrders
+            } else {
+                RiskReason::OpenOrdersCap
+            };
+            assert_eq!(
+                gate.evaluate(&buy(Some(ds("100")), ds("1")), &ctx),
+                Err(expected),
+                "{state:?} should count toward the cap"
+            );
+            // Reduce-only is exempt even at the cap.
+            assert_eq!(
+                gate.evaluate(
+                    &intent(StrategySide::Sell, Some(ds("100")), ds("1"), true),
+                    &ctx
+                ),
+                Ok(Decision::Approve),
+                "{state:?}: reduce-only must still pass at the cap"
+            );
+        }
+    }
+
+    #[test]
+    fn open_order_cap_rejects_the_second_place_in_one_batch() {
+        let meta = asset_meta();
+        let budget = huge_budget();
+        let slot = slot();
+        let acct = account("0", "1000", "0");
+        let mut orders = OrderManager::new(1);
+        // cap = 2; one order is already working, leaving exactly one slot.
+        orders.insert(resting(nth_cloid(1), 0));
+        let mut gate = RiskGate::new(
+            permissive_limits(Some(2)),
+            KillSwitch::new(),
+            Breakers::new(),
+        );
+
+        // The first place in the batch is approved...
+        {
+            let ctx = ctx(CoinId(0), &orders, &acct, &slot, &meta, &budget);
+            assert_eq!(
+                gate.evaluate(&buy(Some(ds("100")), ds("1")), &ctx),
+                Ok(Decision::Approve)
+            );
+        }
+        // ...and the dispatcher inserts every approved place as `PendingNew`
+        // before it gates the next action of the same batch (pipeline
+        // `finish_place`), so the coin is now at its cap...
+        orders.insert(live(
+            nth_cloid(2),
+            0,
+            ds("100"),
+            ds("1"),
+            OrderState::PendingNew,
+            false,
+        ));
+        // ...and the second place in the same batch is refused.
+        let ctx = ctx(CoinId(0), &orders, &acct, &slot, &meta, &budget);
+        assert_eq!(
+            gate.evaluate(&buy(Some(ds("100")), ds("1")), &ctx),
+            Err(RiskReason::OpenOrdersCap)
         );
     }
 }
