@@ -597,7 +597,7 @@ impl RiskGate {
         // coin is at the cap. Reduce-only and cancels are never blocked.
         if !reduce_only
             && let Some(cap) = self.limits.max_open_orders
-            && open_orders_on_coin(ctx.orders, coin) >= cap
+            && ctx.orders.working_on_coin(coin) >= cap
         {
             return Err(RiskReason::OpenOrdersCap);
         }
@@ -687,11 +687,6 @@ fn margin_utilization_bps(account: &AccountState) -> Decimal {
         return Decimal::ZERO;
     }
     account.margin_used / account.account_value * Decimal::from(10_000)
-}
-
-/// Number of working (possibly resting) orders the manager tracks on `coin`.
-fn open_orders_on_coin(orders: &OrderManager, coin: CoinId) -> usize {
-    orders.working().filter(|order| order.coin == coin).count()
 }
 
 /// Every cloid a kill response must cancel: all working orders (SPEC-0004 K-3).

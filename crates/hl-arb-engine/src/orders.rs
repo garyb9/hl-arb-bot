@@ -122,6 +122,13 @@ pub struct OrderManager {
     by_oid: BTreeMap<u64, Cloid>,
     /// Incremental per-coin worst-case in-flight notional; indexes by `CoinId`.
     pending_notional: Vec<Decimal>,
+    /// Incremental per-coin count of working orders; indexes by `CoinId`.
+    ///
+    /// Backs the risk gate's open-order cap in O(1), so a place on one coin
+    /// never scans every tracked order. Kept exact by [`Self::insert`],
+    /// [`Self::remove`], and [`Self::set_state`], on exactly the transitions
+    /// that define [`OrderState::is_working`].
+    working_on_coin: Vec<usize>,
     coin_count: usize,
     /// Incremental count of working orders (`state.is_working()`).
     working_count: usize,
@@ -139,6 +146,7 @@ impl OrderManager {
             by_req: BTreeMap::new(),
             by_oid: BTreeMap::new(),
             pending_notional: vec![Decimal::ZERO; coin_count],
+            working_on_coin: vec![0; coin_count],
             coin_count,
             working_count: 0,
             terminal_count: 0,
@@ -168,6 +176,7 @@ impl OrderManager {
             }
             if old.state.is_working() {
                 self.working_count -= 1;
+                self.dec_working_on_coin(old.coin.index());
             }
             if old.state.is_terminal() {
                 self.terminal_count -= 1;
@@ -181,6 +190,7 @@ impl OrderManager {
         }
         if working {
             self.working_count += 1;
+            self.inc_working_on_coin(coin);
         }
         if terminal {
             self.terminal_count += 1;
@@ -209,6 +219,7 @@ impl OrderManager {
                 *slot -= order.remaining_notional();
             }
             self.working_count -= 1;
+            self.dec_working_on_coin(order.coin.index());
         }
         if order.state.is_terminal() {
             self.terminal_count -= 1;
@@ -259,6 +270,31 @@ impl OrderManager {
     /// `O(1)` (an incremental counter), so the loop can read it every iteration.
     pub fn resting_count(&self) -> usize {
         self.working_count
+    }
+
+    /// Number of working orders the manager tracks on `coin`, in `O(1)`.
+    ///
+    /// Equal to a recount of `self.working().filter(|order| order.coin == coin)`
+    /// and includes every `is_working()` state (`PendingNew`, `Resting`,
+    /// `PartiallyFilled`, `PendingCancel`, `PendingModify`, `Unknown`). The risk
+    /// gate's open-order cap reads this instead of scanning every tracked order.
+    /// An out-of-range coin reads zero, matching [`Self::pending_notional`].
+    pub fn working_on_coin(&self, coin: CoinId) -> usize {
+        self.working_on_coin.get(coin.index()).copied().unwrap_or(0)
+    }
+
+    /// Increment the per-coin working count for an in-range coin.
+    fn inc_working_on_coin(&mut self, coin: usize) {
+        if let Some(slot) = self.working_on_coin.get_mut(coin) {
+            *slot += 1;
+        }
+    }
+
+    /// Decrement the per-coin working count for an in-range coin.
+    fn dec_working_on_coin(&mut self, coin: usize) {
+        if let Some(slot) = self.working_on_coin.get_mut(coin) {
+            *slot -= 1;
+        }
     }
 
     /// Whether any tracked order has an unknown outcome awaiting reconciliation.
@@ -364,8 +400,10 @@ impl OrderManager {
         if was_working != now_working {
             if now_working {
                 self.working_count += 1;
+                self.inc_working_on_coin(coin);
             } else {
                 self.working_count -= 1;
+                self.dec_working_on_coin(coin);
             }
         }
         // Terminal is sticky, so a terminal order never becomes non-terminal.
@@ -908,6 +946,121 @@ mod tests {
         // An unknown order still counts for the dead-man switch and exposure.
         assert_eq!(manager.resting_count(), 1);
         assert_eq!(manager.pending_notional(CoinId(0)), ds("10"));
+        // ...and for the per-coin working counter the open-order cap reads.
+        assert_eq!(manager.working_on_coin(CoinId(0)), 1);
+    }
+
+    #[test]
+    fn working_on_coin_counts_unknown_and_reads_zero_out_of_range() {
+        let mut manager = OrderManager::new(2);
+        let c = cloid(1);
+        manager.insert(live(c, 0, "10", "1", OrderState::PendingNew));
+        assert_eq!(manager.working_on_coin(CoinId(0)), 1);
+
+        // `Unknown` is working (a lost reply may be resting).
+        manager.set_state(c, OrderState::Unknown);
+        assert_eq!(manager.working_on_coin(CoinId(0)), 1);
+
+        // Terminal releases the slot.
+        manager.set_state(c, OrderState::Filled);
+        assert_eq!(manager.working_on_coin(CoinId(0)), 0);
+        assert_eq!(manager.working_on_coin(CoinId(1)), 0);
+        // An out-of-range coin reads zero, like `pending_notional`.
+        assert_eq!(manager.working_on_coin(CoinId(99)), 0);
+    }
+
+    /// A tiny deterministic LCG for the randomized counter test (test-only).
+    struct Rng(u64);
+
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            self.0 = self
+                .0
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            self.0 >> 33
+        }
+
+        fn below(&mut self, n: u64) -> u64 {
+            self.next() % n.max(1)
+        }
+    }
+
+    fn random_state(rng: &mut Rng) -> OrderState {
+        match rng.below(8) {
+            0 => OrderState::PendingNew,
+            1 => OrderState::Resting,
+            2 => OrderState::PartiallyFilled,
+            3 => OrderState::PendingCancel,
+            4 => OrderState::PendingModify,
+            5 => OrderState::Unknown,
+            6 => OrderState::Filled,
+            _ => OrderState::Rejected(RejectReason::Unknown),
+        }
+    }
+
+    /// The per-coin working counter equals a brute-force recount after a
+    /// randomized sequence of place/replace/ack/cancel/fill/reject events, on
+    /// every coin, at every step. The cloid space wraps, so `insert` replaces
+    /// existing orders (including across coins), exercising those paths too.
+    #[test]
+    fn working_on_coin_matches_brute_force_recount() {
+        const COINS: u16 = 5;
+        let mut manager = OrderManager::new(COINS as usize);
+        let mut rng = Rng(0x0BAD_F00D_1234_5678);
+        let mut next_cloid = 1u8;
+
+        for _ in 0..5_000 {
+            match rng.below(10) {
+                // Place (or replace) an order in a random coin/state.
+                op if op < 4 => {
+                    let coin = rng.below(COINS as u64) as u16;
+                    let sz = Decimal::from(rng.below(3) + 1).to_string();
+                    let state = random_state(&mut rng);
+                    manager.insert(live(cloid(next_cloid), coin, "10", &sz, state));
+                    next_cloid = next_cloid.wrapping_add(1);
+                }
+                // Apply one random event to a random tracked order.
+                op if op < 8 => {
+                    let tracked: Vec<Cloid> = manager.iter().map(|o| o.cloid).collect();
+                    if tracked.is_empty() {
+                        continue;
+                    }
+                    let c = tracked[rng.below(tracked.len() as u64) as usize];
+                    match rng.below(6) {
+                        0 => manager.set_state(c, random_state(&mut rng)),
+                        1 => manager.on_fill(Some(c), Decimal::from(rng.below(2) + 1)),
+                        2 => manager.mark_pending_cancel(c),
+                        3 => manager.mark_pending_modify(c),
+                        4 => {
+                            manager.remove(c);
+                        }
+                        _ => manager.set_state(c, OrderState::Unknown),
+                    }
+                }
+                // Opportunistically drop terminal orders.
+                _ => {
+                    manager.prune_terminal();
+                }
+            }
+
+            for coin in 0..COINS {
+                let brute = manager
+                    .working()
+                    .filter(|order| order.coin == CoinId(coin))
+                    .count();
+                assert_eq!(
+                    manager.working_on_coin(CoinId(coin)),
+                    brute,
+                    "coin {coin} counter diverged from brute force"
+                );
+            }
+            assert_eq!(
+                manager.working_count,
+                manager.working().count(),
+                "global working count diverged"
+            );
+        }
     }
 
     #[test]
